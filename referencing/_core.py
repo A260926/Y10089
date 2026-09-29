@@ -303,6 +303,20 @@ class Registry(Mapping[URI, Resource[D]]):
     resources will be retrievable via their own IDs (though this discovery of
     subresources will be delayed until necessary).
 
+    All of that discovery is driven by one incremental *work queue*. Each
+    work item is a ``(base_uri, resource)`` pair. The item is "keyed" when
+    its resource has (or will have) a canonical URI, which is tracked as
+    unexpanded in ``_uncrawled``; unkeyed subresources (those without an
+    internal id) never become work items -- they are expanded the moment
+    they are discovered, since their only effect is to register anchors at
+    their parent's base URI.
+
+    Work items are processed in a stable LIFO order, and a single resource
+    object is expanded at most once: discovering a resource whose canonical
+    URI has already been expanded or scheduled never enqueues it again,
+    which keeps cyclic graphs and shared subresources from growing the
+    queue.
+
     Registries are immutable, and their methods return new instances of the
     registry with the additional resources added to them.
 
@@ -321,6 +335,12 @@ class Registry(Mapping[URI, Resource[D]]):
     )
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
+    _expanded: HashTrieSet[URI] = HashTrieSet()
+    _to_crawl: List[tuple[URI, Resource[D]]] = field(
+        default=List(),
+        eq=False,
+        repr=False,
+    )
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
 
     def __getitem__(self, uri: URI) -> Resource[D]:
@@ -379,15 +399,13 @@ class Registry(Mapping[URI, Resource[D]]):
         if isinstance(new, Resource):
             new = (new,)
 
-        resources = self._resources
-        uncrawled = self._uncrawled
+        pairs = []
         for resource in new:
             id = resource.id()
             if id is None:
                 raise exceptions.NoInternalID(resource=resource)
-            uncrawled = uncrawled.insert(id)
-            resources = resources.insert(id, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+            pairs.append((id, resource))
+        return self.with_resources(pairs)
 
     def __repr__(self) -> str:
         size = len(self)
@@ -406,15 +424,17 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         Get a resource from the registry, crawling or retrieving if necessary.
 
-        May involve crawling to find the given URI if it is not already known,
-        so the returned object is a `Retrieved` object which contains both the
-        resource value as well as the registry which ultimately contained it.
+        Crawling is incremental: only the work strictly necessary to find the
+        given URI is materialized. If crawling the known resources doesn't
+        find it, the retrieval callable is invoked once, and its result is
+        added to the returned registry (without being crawled itself).
         """
-        resource = self._resources.get(uri)
-        if resource is not None:
-            return Retrieved(registry=self, value=resource)
+        if uri in self._expanded:
+            return Retrieved(registry=self, value=self._resources[uri])
 
-        registry = self.crawl()
+        registry = self._advance(target=uri)
+        if uri in registry._expanded:
+            return Retrieved(registry=registry, value=registry._resources[uri])
         resource = registry._resources.get(uri)
         if resource is not None:
             return Retrieved(registry=registry, value=resource)
@@ -439,10 +459,16 @@ class Registry(Mapping[URI, Resource[D]]):
         if uri not in self._resources:
             raise exceptions.NoSuchResource(ref=uri)
 
+        remaining = List()
+        for work in self._to_crawl:
+            if work[0] != uri:
+                remaining = remaining.push_front(work)
         return evolve(
             self,
             resources=self._resources.remove(uri),
             uncrawled=self._uncrawled.discard(uri),
+            expanded=self._expanded.discard(uri),
+            to_crawl=remaining,
             anchors=HashTrieMap(
                 (k, v) for k, v in self._anchors.items() if k[0] != uri
             ),
@@ -451,17 +477,21 @@ class Registry(Mapping[URI, Resource[D]]):
     def anchor(self, uri: URI, name: str):
         """
         Retrieve a given anchor from a resource which must already be crawled.
+
+        Anchors may live in an as-yet undiscovered subresource (including
+        one without an internal id, resolved against ``uri``), so the full
+        work queue is drained before deciding the anchor is absent.
         """
         value = self._anchors.get((uri, name))
         if value is not None:
             return Retrieved(value=value, registry=self)
 
-        registry = self.crawl()
+        registry = self._advance(target=(uri, name))
         value = registry._anchors.get((uri, name))
         if value is not None:
             return Retrieved(value=value, registry=registry)
 
-        resource = self[uri]
+        resource = registry[uri]
         canonical_uri = resource.id()
         if canonical_uri is not None:
             value = registry._anchors.get((canonical_uri, name))
@@ -486,25 +516,7 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         Crawl all added resources, discovering subresources.
         """
-        resources = self._resources
-        anchors = self._anchors
-        uncrawled = [(uri, resources[uri]) for uri in self._uncrawled]
-        while uncrawled:
-            uri, resource = uncrawled.pop()
-
-            id = resource.id()
-            if id is not None:
-                uri = urljoin(uri, id)
-                resources = resources.insert(uri, resource)
-            for each in resource.anchors():
-                anchors = anchors.insert((uri, each.name), each)
-            uncrawled.extend((uri, each) for each in resource.subresources())
-        return evolve(
-            self,
-            resources=resources,
-            anchors=anchors,
-            uncrawled=EMPTY_UNCRAWLED,
-        )
+        return self._advance(target=None)
 
     def with_resource(self, uri: URI, resource: Resource[D]):
         """
@@ -521,13 +533,21 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         resources = self._resources
         uncrawled = self._uncrawled
+        to_crawl = self._to_crawl
         for uri, resource in pairs:
             # Empty fragment URIs are equivalent to URIs without the fragment.
             # TODO: Is this true for non JSON Schema resources? Probably not.
             uri = uri.rstrip("#")
-            uncrawled = uncrawled.insert(uri)
             resources = resources.insert(uri, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+            if uri not in uncrawled:
+                uncrawled = uncrawled.insert(uri)
+                to_crawl = to_crawl.push_front((uri, resource))
+        return evolve(
+            self,
+            resources=resources,
+            uncrawled=uncrawled,
+            to_crawl=to_crawl,
+        )
 
     def with_contents(
         self,
@@ -551,11 +571,13 @@ class Registry(Mapping[URI, Resource[D]]):
         resources = self._resources
         anchors = self._anchors
         uncrawled = self._uncrawled
+        expanded = self._expanded
         retrieve = self._retrieve
         for registry in registries:
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
             uncrawled = uncrawled.update(registry._uncrawled)
+            expanded = expanded.update(registry._expanded)
 
             if registry._retrieve is not _fail_to_retrieve:
                 if registry._retrieve is not retrieve is not _fail_to_retrieve:
@@ -564,11 +586,28 @@ class Registry(Mapping[URI, Resource[D]]):
                         "functions.",
                     )
                 retrieve = registry._retrieve
+
+        # Rebuild a single work queue for the combined ``uncrawled`` set.
+        # Each still-to-expand canonical URI is enqueued once. Input work
+        # items may remember a discovered resource under its (relative)
+        # parent base, so the canonical URI is recomputed from the item's
+        # own resource rather than assumed to equal its queued base.
+        to_crawl = List()
+        enqueued = set()
+        for registry in (self, *registries):
+            for base_uri, resource in registry._to_crawl:
+                id = resource.id()
+                canonical = urljoin(base_uri, id) if id is not None else base_uri
+                if canonical in uncrawled and canonical not in enqueued:
+                    enqueued.add(canonical)
+                    to_crawl = to_crawl.push_front((canonical, resource))
         return evolve(
             self,
             anchors=anchors,
             resources=resources,
             uncrawled=uncrawled,
+            expanded=expanded,
+            to_crawl=to_crawl,
             retrieve=retrieve,
         )
 
@@ -587,6 +626,159 @@ class Registry(Mapping[URI, Resource[D]]):
             base_uri=uri,
             registry=self.with_resource(uri, resource),
         )
+
+    def _advance(self, target):
+        """
+        Process the work queue incrementally until ``target`` is found.
+
+        ``target`` is a resource URI (lookup succeeds once it has been
+        expanded, leaving unrelated work queued). Any other non-`None`
+        value (used for anchor lookups), like `None` (an explicit crawl),
+        drains the whole queue.
+
+        Every entry point shares the same expansion procedure: find the
+        resource's canonical URI, register its anchors at that URI, and
+        schedule each subresource once (relative ids resolved against the
+        parent's canonical URI).
+        """
+        resources = self._resources
+        anchors = self._anchors
+        uncrawled = self._uncrawled
+        expanded = self._expanded
+        to_crawl = self._to_crawl
+
+        while to_crawl:
+            if isinstance(target, str) and target in expanded:
+                # On-demand resource lookup: stop the moment the requested
+                # resource has been expanded, leaving unrelated work queued.
+                break
+
+            base_uri, resource = to_crawl.first
+            to_crawl = to_crawl.rest
+            # A discovered item may remember its parent base even though
+            # it is scheduled under its own resolved URI; clear the pending
+            # mark for the canonical URI before expanding.
+            queued_id = resource.id()
+            pending = (
+                urljoin(base_uri, queued_id)
+                if queued_id is not None
+                else base_uri
+            )
+            uncrawled = uncrawled.discard(pending)
+
+            (
+                resources,
+                anchors,
+                uncrawled,
+                expanded,
+                to_crawl,
+            ) = self._expand(
+                base_uri=base_uri,
+                resource=resource,
+                resources=resources,
+                anchors=anchors,
+                uncrawled=uncrawled,
+                expanded=expanded,
+                to_crawl=to_crawl,
+            )
+        else:
+            uncrawled = EMPTY_UNCRAWLED
+
+        return evolve(
+            self,
+            resources=resources,
+            anchors=anchors,
+            uncrawled=uncrawled,
+            expanded=expanded,
+            to_crawl=to_crawl,
+        )
+
+    @classmethod
+    def _expand(
+        cls,
+        base_uri,
+        resource,
+        resources,
+        anchors,
+        uncrawled,
+        expanded,
+        to_crawl,
+    ):
+        """
+        Expand one resource once.
+
+        Register its canonical URI (if any) and its anchors, then discover
+        its direct subresources. Unkeyed subresources are expanded right
+        away (they only contribute anchors at the parent's base URI); keyed
+        subresources are scheduled for later in stable LIFO order.
+        """
+        canonical = base_uri
+        id = resource.id()
+        if id is not None:
+            canonical = urljoin(base_uri, id)
+            resources = resources.insert(canonical, resource)
+            uncrawled = uncrawled.discard(canonical)
+            expanded = expanded.insert(canonical)
+        for each in resource.anchors():
+            anchors = anchors.insert((canonical, each.name), each)
+        for child in resource.subresources():
+            (
+                resources,
+                anchors,
+                uncrawled,
+                expanded,
+                to_crawl,
+            ) = cls._schedule(
+                base_uri=canonical,
+                resource=child,
+                resources=resources,
+                anchors=anchors,
+                uncrawled=uncrawled,
+                expanded=expanded,
+                to_crawl=to_crawl,
+            )
+        return resources, anchors, uncrawled, expanded, to_crawl
+
+    @classmethod
+    def _schedule(
+        cls,
+        base_uri,
+        resource,
+        resources,
+        anchors,
+        uncrawled,
+        expanded,
+        to_crawl,
+    ):
+        """
+        Discover one subresource and either expand it or enqueue it once.
+        """
+        id = resource.id()
+        if id is None:
+            # No canonical URI: only useful for anchors at the parent's
+            # base URI, so expand it immediately without touching the map.
+            return cls._expand(
+                base_uri=base_uri,
+                resource=resource,
+                resources=resources,
+                anchors=anchors,
+                uncrawled=uncrawled,
+                expanded=expanded,
+                to_crawl=to_crawl,
+            )
+        uri = urljoin(base_uri, id)
+        # Already expanded, or already scheduled-but-unexpanded: cycles and
+        # shared subresources never grow the queue a second time.
+        if uri in expanded or uri in uncrawled:
+            return resources, anchors, uncrawled, expanded, to_crawl
+        # Remember the child under its resolved URI so it is not scheduled
+        # twice, but queue it with the *parent* base it must be resolved
+        # against (its own id may be relative). It is keyed into the
+        # resource map only when it is later expanded.
+        uncrawled = uncrawled.insert(uri)
+        to_crawl = to_crawl.push_front((base_uri, resource))
+        return resources, anchors, uncrawled, expanded, to_crawl
+
 
 
 #: An anchor or resource.
