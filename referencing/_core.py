@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from enum import Enum
 from typing import Any, ClassVar, Generic, Protocol, TypeVar
@@ -13,6 +14,7 @@ from referencing._attrs import frozen
 from referencing.typing import URI, Anchor as AnchorType, D, Mapping, Retrieve
 
 EMPTY_UNCRAWLED: HashTrieSet[URI] = HashTrieSet()
+EMPTY_PENDING = ()
 EMPTY_PREVIOUS_RESOLVERS: List[URI] = List()
 
 
@@ -289,6 +291,69 @@ def _fail_to_retrieve(uri: URI):
     raise exceptions.NoSuchResource(ref=uri)
 
 
+def _pending_key(base: URI, resource: Resource[D]) -> tuple[str, object]:
+    """
+    De-duplication identity of a pending work-queue entry.
+
+    Identified resources are tracked by their canonical URI (which is
+    deterministically ``urljoin(base, resource.id())``); anonymous
+    resources have no canonical URI, so they are tracked by the pair of
+    their base URI and the identity of the shared in-memory object.
+    """
+    canonical = resource.id()
+    if canonical is None:
+        return ("i", (base, id(resource)))
+    return ("u", urljoin(base, canonical))
+
+
+def _uncrawled_for(
+    queue: Iterable[tuple[URI, Resource[D]]],
+) -> HashTrieSet[URI]:
+    """
+    The set of URIs still awaiting expansion, derived from the queue.
+
+    An identified pending item contributes its (predicted) canonical URI and
+    an anonymous item contributes the base URI under which it was scheduled;
+    this mirrors the local ``uncrawled`` list maintained by the previous
+    crawler and keeps the set consistent with the de-duplicated queue.
+    """
+    uncrawled: HashTrieSet[URI] = HashTrieSet()
+    for base, resource in queue:
+        key = _pending_key(base, resource)
+        if key[0] == "u":
+            uncrawled = uncrawled.insert(key[1])  # type: ignore[arg-type]
+        else:
+            uncrawled = uncrawled.insert(key[1][0])  # type: ignore[index]
+    return uncrawled
+
+
+def _merge_pending(
+    first: Sequence[tuple[URI, Resource[D]]],
+    second: Sequence[tuple[URI, Resource[D]]],
+) -> tuple[tuple[URI, Resource[D]], ...]:
+    """
+    Merge two pending queues into one stable, de-duplicated FIFO queue.
+
+    Entries keep the position of their first occurrence (``first`` then
+    ``second``); when a key is repeated, the later entry wins (mirroring
+    map-update semantics) but the original queue position is preserved.
+    """
+    entries: list[tuple[URI, Resource[D]]] = []
+    index: dict[tuple[str, object], int] = {}
+
+    for queue in (first, second):
+        for entry in queue:
+            base, resource = entry
+            key = _pending_key(base, resource)
+            position = index.get(key)
+            if position is None:
+                index[key] = len(entries)
+                entries.append(entry)
+            else:
+                entries[position] = entry
+    return tuple(entries)
+
+
 @frozen
 class Registry(Mapping[URI, Resource[D]]):
     r"""
@@ -321,6 +386,11 @@ class Registry(Mapping[URI, Resource[D]]):
     )
     _anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = HashTrieMap()
     _uncrawled: HashTrieSet[URI] = EMPTY_UNCRAWLED
+    _pending: tuple[tuple[URI, Resource[D]], ...] = field(
+        default=EMPTY_PENDING,
+        eq=False,
+        alias="pending",
+    )
     _retrieve: Retrieve[D] = field(default=_fail_to_retrieve, alias="retrieve")
 
     def __getitem__(self, uri: URI) -> Resource[D]:
@@ -379,15 +449,13 @@ class Registry(Mapping[URI, Resource[D]]):
         if isinstance(new, Resource):
             new = (new,)
 
-        resources = self._resources
-        uncrawled = self._uncrawled
+        registry = self
         for resource in new:
-            id = resource.id()
-            if id is None:
+            canonical = resource.id()
+            if canonical is None:
                 raise exceptions.NoInternalID(resource=resource)
-            uncrawled = uncrawled.insert(id)
-            resources = resources.insert(id, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+            registry = registry._enqueue(canonical, resource)
+        return registry
 
     def __repr__(self) -> str:
         size = len(self)
@@ -406,15 +474,18 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         Get a resource from the registry, crawling or retrieving if necessary.
 
-        May involve crawling to find the given URI if it is not already known,
-        so the returned object is a `Retrieved` object which contains both the
-        resource value as well as the registry which ultimately contained it.
+        Crawling advances the shared materialization queue only as far as
+        needed to discover the given URI; the rest of the queue is left for
+        a later explicit `crawl`. The returned `Retrieved` object contains
+        both the resource value as well as the registry that contained it.
         """
         resource = self._resources.get(uri)
         if resource is not None:
             return Retrieved(registry=self, value=resource)
 
-        registry = self.crawl()
+        registry = self._advance(
+            found=lambda candidate: candidate._resources.get(uri) is not None,
+        )
         resource = registry._resources.get(uri)
         if resource is not None:
             return Retrieved(registry=registry, value=resource)
@@ -439,10 +510,16 @@ class Registry(Mapping[URI, Resource[D]]):
         if uri not in self._resources:
             raise exceptions.NoSuchResource(ref=uri)
 
+        pending = tuple(
+            (base, resource)
+            for base, resource in self._pending
+            if base != uri
+        )
         return evolve(
             self,
             resources=self._resources.remove(uri),
-            uncrawled=self._uncrawled.discard(uri),
+            uncrawled=_uncrawled_for(pending),
+            pending=pending,
             anchors=HashTrieMap(
                 (k, v) for k, v in self._anchors.items() if k[0] != uri
             ),
@@ -456,8 +533,11 @@ class Registry(Mapping[URI, Resource[D]]):
         if value is not None:
             return Retrieved(value=value, registry=self)
 
-        registry = self.crawl()
-        value = registry._anchors.get((uri, name))
+        target = (uri, name)
+        registry = self._advance(
+            found=lambda candidate: target in candidate._anchors,
+        )
+        value = registry._anchors.get(target)
         if value is not None:
             return Retrieved(value=value, registry=registry)
 
@@ -486,25 +566,9 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         Crawl all added resources, discovering subresources.
         """
-        resources = self._resources
-        anchors = self._anchors
-        uncrawled = [(uri, resources[uri]) for uri in self._uncrawled]
-        while uncrawled:
-            uri, resource = uncrawled.pop()
-
-            id = resource.id()
-            if id is not None:
-                uri = urljoin(uri, id)
-                resources = resources.insert(uri, resource)
-            for each in resource.anchors():
-                anchors = anchors.insert((uri, each.name), each)
-            uncrawled.extend((uri, each) for each in resource.subresources())
-        return evolve(
-            self,
-            resources=resources,
-            anchors=anchors,
-            uncrawled=EMPTY_UNCRAWLED,
-        )
+        if not self._pending:
+            return self
+        return self._advance()
 
     def with_resource(self, uri: URI, resource: Resource[D]):
         """
@@ -519,15 +583,118 @@ class Registry(Mapping[URI, Resource[D]]):
         r"""
         Add the given `Resource`\ s to the registry, without crawling them.
         """
-        resources = self._resources
-        uncrawled = self._uncrawled
+        registry = self
         for uri, resource in pairs:
             # Empty fragment URIs are equivalent to URIs without the fragment.
             # TODO: Is this true for non JSON Schema resources? Probably not.
-            uri = uri.rstrip("#")
-            uncrawled = uncrawled.insert(uri)
-            resources = resources.insert(uri, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+            registry = registry._enqueue(uri.rstrip("#"), resource)
+        return registry
+
+    def _enqueue(self, uri: URI, resource: Resource[D]) -> Registry[D]:
+        """
+        Schedule one explicitly added/retrieved resource on the queue.
+
+        Explicit entries (``__rmatmul__``, ``with_resource(s)`` or a
+        successful retrieve call) always replace any existing pending entry
+        for their base URI, even if that URI was crawled in an earlier
+        generation; this re-opens just that URI without revisiting the rest
+        of the graph.
+        """
+        resources = self._resources.insert(uri, resource)
+        pending = _merge_pending(self._pending, ((uri, resource),))
+        return evolve(
+            self,
+            resources=resources,
+            uncrawled=_uncrawled_for(pending),
+            pending=pending,
+        )
+
+    def _advance(
+        self,
+        found: Callable[[Registry[D]], object] = lambda registry: False,
+    ) -> Registry[D]:
+        """
+        Process the materialization queue in stable (FIFO) order.
+
+        Every pending resource is expanded at most once per advance: its
+        canonical URI is normalized, its anchors are registered, and its
+        subresources are scheduled. Processing stops as soon as ``found``
+        holds, leaving the remainder of the queue (including the just-expanded
+        resource's newly scheduled children) for a later advance; with no
+        predicate the queue is fully drained.
+        """
+        resources = self._resources
+        anchors = self._anchors
+        queue = deque(self._pending)
+        # Work-item identities already present in the queue or expanded in
+        # this advance, so cycles and shared subresources never re-enqueue.
+        scheduled = {_pending_key(uri, resource) for uri, resource in queue}
+        # Identities of resource objects already expanded in this advance, so
+        # a resource present under several alias entries runs only once.
+        expanded: set[int] = set()
+
+        while queue:
+            uri, resource = queue.popleft()
+
+            if id(resource) in expanded:
+                continue
+            expanded.add(id(resource))
+
+            canonical_uri = resource.id()
+            if canonical_uri is not None:
+                uri = urljoin(uri, canonical_uri)
+                resources = resources.insert(uri, resource)
+
+            for each in resource.anchors():
+                anchors = anchors.insert((uri, each.name), each)
+
+            for base, each in self._schedule_subresources(uri, resource):
+                key = _pending_key(base, each)
+                if key in scheduled:
+                    continue
+                scheduled.add(key)
+                queue.append((base, each))
+
+            if found(
+                evolve(
+                    self,
+                    resources=resources,
+                    anchors=anchors,
+                    uncrawled=_uncrawled_for(queue),
+                    pending=tuple(queue),
+                ),
+            ):
+                return evolve(
+                    self,
+                    resources=resources,
+                    anchors=anchors,
+                    uncrawled=_uncrawled_for(queue),
+                    pending=tuple(queue),
+                )
+
+        return evolve(
+            self,
+            resources=resources,
+            anchors=anchors,
+            uncrawled=EMPTY_UNCRAWLED,
+            pending=EMPTY_PENDING,
+        )
+
+    @staticmethod
+    def _schedule_subresources(
+        uri: URI,
+        resource: Resource[D],
+    ) -> Iterator[tuple[URI, Resource[D]]]:
+        """
+        Yield ``(resolve_base, subresource)`` pairs for each direct child.
+
+        ``resolve_base`` is the parent's canonical URI; a child with an
+        internal ID is normalized against it when the child is itself expanded
+        (identical to the previous crawler), while an anonymous child keeps
+        the parent as both its base and its anchor key.
+        """
+        for each in resource.subresources():
+            yield uri, each
 
     def with_contents(
         self,
@@ -551,11 +718,13 @@ class Registry(Mapping[URI, Resource[D]]):
         resources = self._resources
         anchors = self._anchors
         uncrawled = self._uncrawled
+        pending = self._pending
         retrieve = self._retrieve
         for registry in registries:
             resources = resources.update(registry._resources)
             anchors = anchors.update(registry._anchors)
-            uncrawled = uncrawled.update(registry._uncrawled)
+            pending = _merge_pending(pending, registry._pending)
+            uncrawled = _uncrawled_for(pending)
 
             if registry._retrieve is not _fail_to_retrieve:
                 if registry._retrieve is not retrieve is not _fail_to_retrieve:
@@ -569,6 +738,7 @@ class Registry(Mapping[URI, Resource[D]]):
             anchors=anchors,
             resources=resources,
             uncrawled=uncrawled,
+            pending=pending,
             retrieve=retrieve,
         )
 
